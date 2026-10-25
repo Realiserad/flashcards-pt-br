@@ -14,7 +14,7 @@ Every card gets two pieces of media that are not in the JSON:
 * a picture, searched for with `--source` (Openverse, or Pixabay or Unsplash
   with an access key), using the card's `visual_link` as the query, and
 * an mp3 of the Brazilian Portuguese sentence, from Google Translate's TTS
-  endpoint.
+  endpoint or, with `--tts azure`, from Azure Speech in Microsoft Foundry.
 
 Both are attached to the side of the card showing the Portuguese sentence, and
 both cards of a pair (pt→en and en→pt) share the same files.
@@ -32,6 +32,13 @@ but a demo key is good for only about 25 new pictures an hour.
 Both read their key from `--access-key`, from `PIXABAY_API_KEY` or
 `UNSPLASH_ACCESS_KEY` in the environment, or from a `.pixabay-key` or
 `.unsplash-key` file next to this script.
+
+Google Translate's TTS endpoint is free but starts throttling on a big deck.
+`--tts azure` uses an Azure Speech (Microsoft Foundry) resource instead, and
+reads its key and region from `--azure-key` and `--azure-region`, from
+`AZURE_SPEECH_KEY` and `AZURE_SPEECH_REGION`, or from `.azure-speech-key` and
+`.azure-speech-region` files. Each sentence is read by one of `--voices`, picked
+by the sentence so that re-runs keep the same voice.
 
 Usage:
 
@@ -70,6 +77,17 @@ UNSPLASH_SEARCH = "https://api.unsplash.com/search/photos"
 OPENVERSE_SEARCH = "https://api.openverse.org/v1/images/"
 PIXABAY_SEARCH = "https://pixabay.com/api/"
 GOOGLE_TTS = "https://translate.google.com/translate_tts"
+AZURE_TTS = "https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
+AZURE_VOICE_LIST = (
+    "https://{region}.tts.speech.microsoft.com/cognitiveservices/voices/list"
+)
+# Two women and two men, so the ear gets used to more than one speaker.
+AZURE_VOICES = (
+    "pt-BR-FranciscaNeural",
+    "pt-BR-AntonioNeural",
+    "pt-BR-ThalitaMultilingualNeural",
+    "pt-BR-MacerioMultilingualNeural",
+)
 # Unsplash allows 50 requests/hour for a demo app, 5000 once it is approved for
 # production. Searching and reporting a download are one request each, so a
 # demo key is good for about 25 new pictures per hour. Cached ones are free.
@@ -659,29 +677,74 @@ def shrink(data: bytes, max_size: int) -> bytes:
         return buffer.getvalue()
 
 
+@dataclass(frozen=True)
+class Azure:
+    """Where and as whom Azure Speech reads the sentences."""
+
+    key: str
+    region: str
+    voices: tuple[str, ...]
+
+    def voice_for(self, pair: Pair) -> str:
+        return self.voices[int(pair.audio_key, 16) % len(self.voices)]
+
+
+def google_tts(session: requests.Session, sentence: str) -> requests.Response:
+    url = f"{GOOGLE_TTS}?ie=UTF-8&tl=pt&client=tw-ob&q={urllib.parse.quote(sentence)}"
+    reply = session.get(url, timeout=60)
+    if reply.status_code == 429:
+        raise Throttled(
+            retry_after_seconds(reply, 60.0), "Google Translate is throttling"
+        )
+    reply.raise_for_status()
+    return reply
+
+
+def azure_tts(
+    session: requests.Session, azure: Azure, voice: str, sentence: str
+) -> requests.Response:
+    ssml = (
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+        f'xml:lang="pt-BR"><voice name="{voice}">'
+        f"{html.escape(sentence, quote=False)}</voice></speak>"
+    )
+    reply = session.post(
+        AZURE_TTS.format(region=azure.region),
+        data=ssml.encode("utf-8"),
+        headers={
+            "Ocp-Apim-Subscription-Key": azure.key,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+        },
+        timeout=60,
+    )
+    if reply.status_code == 429:
+        raise Throttled(retry_after_seconds(reply, 10.0), "Azure Speech is throttling")
+    reply.raise_for_status()
+    return reply
+
+
 def fetch_audio(
     session: requests.Session,
     limiter: RateLimiter,
     pair: Pair,
     cache_dir: Path,
     max_wait: float,
+    azure: Azure | None,
 ) -> None:
+    # Whichever service made it, a cached recording is kept: switching services
+    # only fills in the sentences that have none yet.
     path = cache_dir / f"ptbr-{pair.audio_key}.mp3"
     if path.exists():
         pair.audio = path
         return
 
     sentence = plain(pair.portuguese)
-    url = f"{GOOGLE_TTS}?ie=UTF-8&tl=pt&client=tw-ob&q={urllib.parse.quote(sentence)}"
 
     def once() -> requests.Response:
-        reply = session.get(url, timeout=60)
-        if reply.status_code == 429:
-            raise Throttled(
-                retry_after_seconds(reply, 60.0), "Google Translate is throttling"
-            )
-        reply.raise_for_status()
-        return reply
+        if azure:
+            return azure_tts(session, azure, azure.voice_for(pair), sentence)
+        return google_tts(session, sentence)
 
     try:
         response = waiting_out_throttles(once, limiter, max_wait)
@@ -713,7 +776,7 @@ def fetch_image_step(
 def fetch_audio_step(
     session: requests.Session, limiter: RateLimiter, pair: Pair, args: argparse.Namespace
 ) -> None:
-    fetch_audio(session, limiter, pair, args.cache_dir, args.max_wait)
+    fetch_audio(session, limiter, pair, args.cache_dir, args.max_wait, args.azure)
 
 
 def collect_media(pairs: list[Pair], args: argparse.Namespace) -> None:
@@ -740,7 +803,10 @@ def collect_media(pairs: list[Pair], args: argparse.Namespace) -> None:
                 flush=True,
             )
 
-    print(f"Fetching media for {len(pairs)} sentences from {args.source}…")
+    print(
+        f"Fetching media for {len(pairs)} sentences, pictures from {args.source}, "
+        f"audio from {args.tts}…"
+    )
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         list(pool.map(work, pairs))
 
@@ -850,24 +916,94 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "$PIXABAY_API_KEY or a .pixabay-key file for --source pixabay, and to "
         "$UNSPLASH_ACCESS_KEY or a .unsplash-key file for --source unsplash",
     )
+    parser.add_argument(
+        "--tts",
+        choices=("google", "azure"),
+        default="google",
+        help="where the audio comes from (default: google, which is free but "
+        "throttles big batches; azure needs an Azure Speech resource in "
+        "Microsoft Foundry)",
+    )
+    parser.add_argument(
+        "--azure-key",
+        default=None,
+        help="key of the Azure Speech resource; defaults to $AZURE_SPEECH_KEY "
+        "or a .azure-speech-key file",
+    )
+    parser.add_argument(
+        "--azure-region",
+        default=None,
+        help="region of the Azure Speech resource, e.g. swedencentral; defaults "
+        "to $AZURE_SPEECH_REGION or a .azure-speech-region file",
+    )
+    parser.add_argument(
+        "--voices",
+        default=",".join(AZURE_VOICES),
+        help="comma-separated Azure voices to take turns reading the sentences "
+        f"(default: {','.join(AZURE_VOICES)})",
+    )
     return parser.parse_args(argv)
 
 
-def resolve_access_key(given: str | None, source: Source) -> str | None:
+def setting(given: str | None, env: str, filename: str) -> str | None:
+    """`given`, or else from the environment, or else from a file here or next
+    to this script."""
     if given:
         return given.strip()
-    if not source.needs_key:
-        return None
-    from_env = os.environ.get(source.key_env, "").strip()
+    from_env = os.environ.get(env, "").strip()
     if from_env:
         return from_env
     for directory in (Path.cwd(), Path(__file__).resolve().parent):
-        key_file = directory / source.key_file
-        if key_file.is_file():
-            key = key_file.read_text("utf-8").strip()
-            if key:
-                return key
+        path = directory / filename
+        if path.is_file():
+            value = path.read_text("utf-8").strip()
+            if value:
+                return value
     return None
+
+
+def resolve_access_key(given: str | None, source: Source) -> str | None:
+    if given or not source.needs_key:
+        return given.strip() if given else None
+    return setting(None, source.key_env, source.key_file)
+
+
+def resolve_azure(args: argparse.Namespace) -> Azure | str:
+    """The Azure Speech settings, or what is wrong with them."""
+    key = setting(args.azure_key, "AZURE_SPEECH_KEY", ".azure-speech-key")
+    region = setting(args.azure_region, "AZURE_SPEECH_REGION", ".azure-speech-region")
+    if not key or not region:
+        return (
+            "--tts azure needs the key and region of an Azure Speech resource. "
+            "Pass --azure-key and --azure-region, set AZURE_SPEECH_KEY and "
+            "AZURE_SPEECH_REGION, or put them in .azure-speech-key and "
+            ".azure-speech-region files."
+        )
+    voices = tuple(v.strip() for v in args.voices.split(",") if v.strip())
+    if not voices:
+        return "--voices needs at least one voice"
+    # Checking once up front turns a wrong key, region or voice name into one
+    # clear error instead of thousands of failed sentences.
+    try:
+        reply = make_session().get(
+            AZURE_VOICE_LIST.format(region=region),
+            headers={"Ocp-Apim-Subscription-Key": key},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        return (
+            f"Cannot reach Azure Speech in region {region} — Azure region names "
+            f"look like eastus2 or swedencentral: {exc}"
+        )
+    if reply.status_code in (401, 403):
+        return f"Azure Speech rejected the key for region {region} ({reply.status_code})"
+    if not reply.ok:
+        return f"Azure Speech voice list failed: HTTP {reply.status_code}"
+    known = {voice["ShortName"] for voice in reply.json()}
+    unknown = [voice for voice in voices if voice not in known]
+    if unknown:
+        return f"Azure Speech has no voice called {', '.join(unknown)}"
+    return Azure(key, region, voices)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -881,6 +1017,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    args.azure = None
+    if args.tts == "azure":
+        azure = resolve_azure(args)
+        if isinstance(azure, str):
+            print(azure, file=sys.stderr)
+            return 1
+        args.azure = azure
 
     try:
         cards = json.loads(args.input.read_text("utf-8"))

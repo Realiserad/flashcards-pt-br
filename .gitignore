@@ -3,3 +3,5 @@
 .media-cache/
 *.apkg
 __pycache__/
+.azure-speech-key
+.azure-speech-region

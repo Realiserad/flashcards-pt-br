@@ -37,3 +37,16 @@ The script adds two things that are not in the JSON: a picture from
 [Openverse](https://openverse.org), and an audio of the Portuguese 
 sentence from Google Translate's TTS endpoint. Both are cached in 
 `--cache-dir`, so re-runs only fetch what is new.
+
+Google Translate throttles big batches. To use Azure Speech in Microsoft
+Foundry for the audio instead, pass `--tts azure` together with the key and
+region of a Speech resource (or set `AZURE_SPEECH_KEY` and
+`AZURE_SPEECH_REGION`):
+
+```bash
+uv run create_apkg.py --input flashcards.json --output flashcards.apkg \
+    --tts azure --azure-region swedencentral
+```
+
+The sentences are read by four pt-BR voices in turn; choose others with
+`--voices`.
