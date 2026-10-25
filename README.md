@@ -7,6 +7,8 @@ with audio and a picture. The deck has cards for both PT-BR -> EN for
 comprehension (Wernicke’s area) and EN -> PT-BR for generation and
 articulation (Broca’s area).
 
+<img width="826" height="569" alt="Screenshot from 2026-10-25 10-24-59" src="https://github.com/user-attachments/assets/e4a40058-aecb-493c-aa52-536a8f135703" />
+
 # How to use
 
 The `apkg` file can be imported into [Anki](https://apps.ankiweb.net).
