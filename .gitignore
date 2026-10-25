@@ -1,0 +1,5 @@
+.unsplash-key
+.pixabay-key
+.media-cache/
+*.apkg
+__pycache__/
